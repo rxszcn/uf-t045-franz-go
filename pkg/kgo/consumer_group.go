@@ -253,7 +253,11 @@ func (cl *Client) LeaveGroup() {
 // For share groups: this drains any pending acks, releases records that
 // were acquired but never finalized, closes each per-broker share
 // session, and sends the final ShareGroupHeartbeat with MemberEpoch=-1
-// to leave the group. LeaveGroupContext is safe to call concurrently
+// to leave the group. After all fetch and heartbeat workers have stopped
+// and before the sessions are closed, OnPartitionsRevoked is called with
+// everything still assigned; acks issued from that callback are flushed
+// with the closing ShareAcknowledge.
+// LeaveGroupContext is safe to call concurrently
 // with [Client.PollRecords], [Client.MarkAcks], and [Record.Ack]:
 // after the leave begins, PollRecords will either return any records
 // that were already buffered (the caller may still ack them) or
@@ -382,17 +386,35 @@ func (c *consumer) initGroup() {
 	// this to decide whether the BlockRebalanceOnPoll gate applies.
 	g.cfg.userHasOnAssign = g.cfg.onAssigned != nil
 
-	// INVARIANT: after this loop, on{Assigned,Revoked,Lost} are all non-nil.
-	// The wrapper unconditionally replaces each callback so we can log entry
-	// even when the user did not provide one. Downstream callers rely on this
-	// and skip nil-checks.
+	g.cfg.logWrapPartitionCallbacks()
+
+	// For non-regex topics, we explicitly ensure they exist for loading
+	// metadata. This is of no impact if we are *also* consuming via regex,
+	// but that is no problem.
+	if len(g.cfg.topics) > 0 && !g.cfg.regex {
+		topics := make([]string, 0, len(g.cfg.topics))
+		for topic := range g.cfg.topics {
+			topics = append(topics, topic)
+		}
+		g.tps.storeTopics(topics)
+	}
+}
+
+// logWrapPartitionCallbacks unconditionally replaces each
+// on{Assigned,Revoked,Lost} callback with a wrapper that logs entry and
+// hands the user a dup of the assignment map.
+//
+// INVARIANT: after this runs, on{Assigned,Revoked,Lost} are all non-nil.
+// Downstream callers rely on this and skip nil-checks. Used by both the
+// classic group consumer and the share consumer.
+func (cfg *cfg) logWrapPartitionCallbacks() {
 	for _, logOn := range []struct {
 		name string
 		set  *func(context.Context, *Client, map[string][]int32)
 	}{
-		{"OnPartitionsAssigned", &g.cfg.onAssigned},
-		{"OnPartitionsRevoked", &g.cfg.onRevoked},
-		{"OnPartitionsLost", &g.cfg.onLost},
+		{"OnPartitionsAssigned", &cfg.onAssigned},
+		{"OnPartitionsRevoked", &cfg.onRevoked},
+		{"OnPartitionsLost", &cfg.onLost},
 	} {
 		user := *logOn.set
 		name := logOn.name
@@ -416,17 +438,6 @@ func (c *consumer) initGroup() {
 				user(ctx, cl, dup)
 			}
 		}
-	}
-
-	// For non-regex topics, we explicitly ensure they exist for loading
-	// metadata. This is of no impact if we are *also* consuming via regex,
-	// but that is no problem.
-	if len(g.cfg.topics) > 0 && !g.cfg.regex {
-		topics := make([]string, 0, len(g.cfg.topics))
-		for topic := range g.cfg.topics {
-			topics = append(topics, topic)
-		}
-		g.tps.storeTopics(topics)
 	}
 }
 

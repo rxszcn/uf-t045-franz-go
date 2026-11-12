@@ -388,6 +388,10 @@ func (c *consumer) initShare() {
 	sc.cond = sync.NewCond(&sc.mu)
 	c.s = sc
 
+	// Same wrapping as the classic group consumer: after this, the
+	// on{Assigned,Revoked,Lost} callbacks are all non-nil and log entry.
+	sc.cfg.logWrapPartitionCallbacks()
+
 	if len(sc.cfg.topics) > 0 && !sc.cfg.regex {
 		topics := make([]string, 0, len(sc.cfg.topics))
 		for topic := range sc.cfg.topics {
@@ -585,9 +589,10 @@ func (cl *Client) FlushAcks(ctx context.Context) error {
 //  1. Set dying (single-shot guard + blocks new goroutines).
 //  2. Cancel fm.ctx so manage + source loops exit.
 //  3. Wait for all workers (manage + source loops) to reach 0.
-//  4. Release lastPolled and buffered records, drain fetchManager slots.
-//  5. Per-source FINAL_EPOCH ShareFetch with remaining acks.
-//  6. Leave heartbeat (MemberEpoch=-1).
+//  4. Fire OnPartitionsRevoked for everything still assigned.
+//  5. Release lastPolled and buffered records, drain fetchManager slots.
+//  6. Per-source FINAL_EPOCH ShareFetch with remaining acks.
+//  7. Leave heartbeat (MemberEpoch=-1).
 //
 // Called from a fresh goroutine by LeaveGroupContext. The caller
 // selects on sc.left or ctx.Done.
@@ -612,6 +617,18 @@ func (sc *shareConsumer) leave(ctx context.Context) {
 		sc.cond.Wait()
 	}
 	sc.mu.Unlock()
+
+	// Fire OnPartitionsRevoked for everything we were assigned. With all
+	// workers stopped, no new fetches start; acks the user issues in the
+	// callback land on cursor pendingAcks and are delivered by the
+	// FINAL_EPOCH session close below. FlushAcks must not be called from
+	// this callback: the source loops that would send acks have exited,
+	// so pending acks only drain in closeShareSession, which runs after
+	// the callback returns -- FlushAcks would wait forever.
+	if assigned := sc.nowAssigned.read(); len(assigned) > 0 {
+		sc.cfg.onRevoked(sc.cl.ctx, sc.cl, assigned)
+	}
+	sc.nowAssigned.store(nil)
 
 	// A user PollRecords could still be in flight: even after
 	// fm.cancel, the non-deterministic select may wake on the
@@ -1048,7 +1065,7 @@ func (sc *shareConsumer) manage() {
 			)
 			sc.lastSentSubscribedTopics = nil
 			sc.lastSentRack = false
-			sc.assignPartitions(nil)
+			sc.loseAssignment()
 			sc.unresolvedAssigns = nil
 			sc.cl.allSources(func(s *source) {
 				s.resetShareSession()
@@ -1254,7 +1271,43 @@ func (sc *shareConsumer) resolveUnresolvedTopicIDs() map[string][]int32 {
 	return dst
 }
 
+// assignPartitions applies a new broker assignment delivered by a
+// heartbeat: partitions we had that are no longer assigned are revoked
+// (firing OnPartitionsRevoked), and newly assigned partitions are
+// activated (firing OnPartitionsAssigned).
 func (sc *shareConsumer) assignPartitions(assignments map[string][]int32) {
+	sc.updateAssignment(assignments, sc.cfg.onRevoked)
+}
+
+// loseAssignment drops our entire assignment because the broker fenced or
+// forgot us (UNKNOWN_MEMBER_ID, FENCED_MEMBER_EPOCH, GROUP_ID_NOT_FOUND):
+// everything we had is outright lost, not revoked, so this fires
+// OnPartitionsLost rather than OnPartitionsRevoked.
+func (sc *shareConsumer) loseAssignment() {
+	sc.updateAssignment(nil, sc.cfg.onLost)
+}
+
+// updateAssignment reconciles our cursors with a new broker assignment.
+// revokedFn is the callback fired for partitions that were active and are
+// no longer assigned: OnPartitionsRevoked for a broker-driven assignment
+// change, OnPartitionsLost when our membership is gone.
+//
+// Lifecycle callback timing:
+//
+//   - The revoked callback runs after the revoked cursors are deactivated
+//     (no new fetches start for them) and before any new partition is
+//     activated. Revocation does not invalidate already-acquired records:
+//     share acks are session-based, so records polled from a revoked
+//     partition remain ackable until their acquisition lock expires.
+//   - The assigned callback runs after the new cursors are activated but
+//     before their sources are woken (the wake is deferred to function
+//     return), so no records for newly assigned partitions are polled
+//     before the callback returns.
+//
+// Both callbacks run on the manage goroutine, serialized with heartbeats;
+// the member epoch visible via GroupMetadata is already the epoch that
+// delivered the assignment.
+func (sc *shareConsumer) updateAssignment(assignments map[string][]int32, revokedFn func(context.Context, *Client, map[string][]int32)) {
 	sc.cfg.logger.Log(LogLevelInfo, "assigning share partitions",
 		"group", sc.cfg.shareGroup,
 		"assignments", assignments,
@@ -1270,7 +1323,11 @@ func (sc *shareConsumer) assignPartitions(assignments map[string][]int32) {
 		}
 	}()
 
-	// Revoke what was lost.
+	// Revoke what was lost. A partition is reported to the user only if
+	// its cursor was actually active: partitions we never activated
+	// (metadata lagged the assignment) never fired OnPartitionsAssigned,
+	// so firing a revoke for them would be asymmetric noise.
+	var revoked map[string][]int32
 	for t, oldPs := range old {
 		newPs := assignments[t]
 		tp, ok := tps[t]
@@ -1286,9 +1343,17 @@ func (sc *shareConsumer) assignPartitions(assignments map[string][]int32) {
 				continue
 			}
 			cursor := td.partitions[p].shareCursor
-			cursor.assigned.Store(false)
+			if cursor.assigned.Swap(false) {
+				if revoked == nil {
+					revoked = make(map[string][]int32)
+				}
+				revoked[t] = append(revoked[t], p)
+			}
 			sourcesToWake[cursor.source.Load()] = struct{}{}
 		}
+	}
+	if len(revoked) > 0 {
+		revokedFn(sc.cl.ctx, sc.cl, revoked)
 	}
 
 	// Add what is new. We skip based on the cursor's own activation
@@ -1296,6 +1361,7 @@ func (sc *shareConsumer) assignPartitions(assignments map[string][]int32) {
 	// can be in nowAssigned but never activated (skipped below because
 	// our metadata did not know it yet), and it must be re-attempted on
 	// a later pass.
+	var added map[string][]int32
 	var needsMetaUpdate bool
 	sc.pendingAssigns = false
 	for t, newPs := range assignments {
@@ -1337,11 +1403,18 @@ func (sc *shareConsumer) assignPartitions(assignments map[string][]int32) {
 			if cursor.assigned.Swap(true) {
 				continue // already active from a prior pass
 			}
+			if added == nil {
+				added = make(map[string][]int32)
+			}
+			added[t] = append(added[t], p)
 			sourcesToWake[cursor.source.Load()] = struct{}{}
 		}
 	}
 	if needsMetaUpdate {
 		sc.cl.triggerUpdateMetadataNow("share assignment has unknown topic or partition, or leader has no source")
+	}
+	if len(added) > 0 {
+		sc.cfg.onAssigned(sc.cl.ctx, sc.cl, added)
 	}
 
 	sc.nowAssigned.store(assignments)

@@ -443,9 +443,6 @@ func (cfg *cfg) validate() error {
 		if cfg.autocommitGreedy || cfg.autocommitMarks || cfg.autocommitDisable || cfg.commitCallback != nil {
 			return errors.New("autocommit options are not applicable to share groups")
 		}
-		if cfg.onLost != nil || cfg.onRevoked != nil || cfg.onAssigned != nil {
-			return errors.New("partition lifecycle callbacks are not supported with share groups")
-		}
 		if cfg.shareMaxRecords < -1 || cfg.shareMaxRecords == 0 {
 			return errors.New("ShareMaxRecords must be positive")
 		}
@@ -2022,6 +2019,10 @@ func ConsumerGroup(group string) GroupOpt {
 // polling, ack or renew (AckRenew) them within ConnIdleTimeout, otherwise
 // the idle connection can be closed and the records delivered to another
 // member.
+//
+// The [OnPartitionsAssigned], [OnPartitionsRevoked], and
+// [OnPartitionsLost] callbacks are supported in share groups; see their
+// docs for share-specific timing and ack semantics.
 func ShareGroup(group string) GroupOpt {
 	return groupOpt{func(cfg *cfg) { cfg.shareGroup = group }}
 }
@@ -2242,6 +2243,14 @@ func AdjustFetchOffsetsFn(adjustOffsetsBeforeAssign func(context.Context, map[st
 // for your callback to return - a permanent deadlock. To leave from within
 // a callback, use LeaveGroupContext with a nil context (it triggers the
 // leave without waiting), or call LeaveGroup from a separate goroutine.
+//
+// When consuming in a [ShareGroup], this function is called on the share
+// group management goroutine after a heartbeat delivers a new assignment
+// from the broker, once for each newly activated partition; partitions
+// that stay assigned across heartbeats do not re-trigger it. It runs
+// before any fetch for the new partitions is issued, and the member epoch
+// reported by [Client.GroupMetadata] is already the epoch that delivered
+// the assignment.
 func OnPartitionsAssigned(onAssigned func(context.Context, *Client, map[string][]int32)) GroupOpt {
 	return groupOpt{func(cfg *cfg) { cfg.onAssigned = onAssigned }}
 }
@@ -2277,6 +2286,20 @@ func OnPartitionsAssigned(onAssigned func(context.Context, *Client, map[string][
 //
 // Do not call Close or LeaveGroup synchronously from within this callback;
 // see the warning on [OnPartitionsAssigned].
+//
+// When consuming in a [ShareGroup], this function is called when a
+// heartbeat's new assignment drops partitions you were consuming, and once
+// more during [Client.LeaveGroup] (or Close) for everything still
+// assigned. Revocation does not invalidate records you already acquired:
+// share acks are session-based, not assignment-based, so records polled
+// from a revoked partition remain ackable until their acquisition lock
+// expires, and acks you issue inside this callback are delivered normally.
+// During leave, the callback runs after all fetch and heartbeat workers
+// have stopped and before the final session close, so acks issued in it
+// are flushed with the closing ShareAcknowledge; do not call
+// [Client.FlushAcks] from the callback in that window, because the loops
+// that would send acks have already exited. PurgeConsumeTopics does not
+// trigger this callback.
 func OnPartitionsRevoked(onRevoked func(context.Context, *Client, map[string][]int32)) GroupOpt {
 	return groupOpt{func(cfg *cfg) { cfg.onRevoked = onRevoked }}
 }
@@ -2299,6 +2322,12 @@ func OnPartitionsRevoked(onRevoked func(context.Context, *Client, map[string][]i
 //
 // Do not call Close or LeaveGroup synchronously from within this callback;
 // see the warning on [OnPartitionsAssigned].
+//
+// When consuming in a [ShareGroup], this function is called when the
+// broker fences or forgets your member (UNKNOWN_MEMBER_ID,
+// FENCED_MEMBER_EPOCH, or GROUP_ID_NOT_FOUND from a heartbeat), with the
+// full assignment you had. Acks issued from it are likely rejected by the
+// broker.
 func OnPartitionsLost(onLost func(context.Context, *Client, map[string][]int32)) GroupOpt {
 	return groupOpt{func(cfg *cfg) { cfg.onLost = onLost }}
 }
